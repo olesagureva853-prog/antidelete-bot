@@ -121,7 +121,10 @@ async def cmd_start(message: Message, bot: Bot):
         f"3️⃣ Введите имя этого бота: <code>@{bot_info.username}</code> и добавьте его.\n"
         "4️⃣ Выберите чаты, за которыми бот будет наблюдать (все личные чаты).\n\n"
         "✅ После этого любые сообщения, которые удалят или отредактируют ваши собеседники, "
-        "будут мгновенно пересылаться вам прямо в этот диалог с ботом!"
+        "будут мгновенно пересылаться вам прямо в этот диалог с ботом!\n\n"
+        "🛠 <b>Команды управления:</b>\n"
+        "• /status — статистика базы данных и статус подключений\n"
+        "• /backup — скачать резервную копию базы данных (для сохранения истории при обновлениях)"
     )
     await message.answer(text)
 
@@ -141,9 +144,42 @@ async def cmd_status(message: Message):
         f"💾 Сообщений в кэше: <b>{stats['total_messages']}</b>\n"
         f"🗑 Зафиксировано удалений: <b>{stats['deleted_messages']}</b>\n"
         f"📁 Папка медиа: <code>{config.MEDIA_DIR}</code>\n"
-        f"🧹 Автоочистка записей: каждые <b>{config.RETENTION_DAYS} дн.</b>"
+        f"🧹 Автоочистка записей: каждые <b>{config.RETENTION_DAYS} дн.</b>\n\n"
+        "💡 <i>Используйте /backup, чтобы скачать резервную копию всей базы данных.</i>"
     )
     await message.answer(text)
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message, bot: Bot):
+    # Создание и отправка резервной копии базы данных
+    sender_id = message.from_user.id if message.from_user else 0
+    if not await db.is_owner(sender_id):
+        await message.answer("⛔ <b>Доступ запрещён.</b> Эта команда доступна только владельцу бота.")
+        return
+
+    backup_path = await db.create_backup()
+    if not backup_path or not os.path.exists(backup_path):
+        await message.answer("⚠️ База данных пока пуста или не инициализирована.")
+        return
+
+    stats = await db.get_stats()
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+    caption = (
+        "📦 <b>РЕЗЕРВНАЯ КОПИЯ БАЗЫ ДАННЫХ</b>\n\n"
+        f"📅 <b>Дата:</b> {now_str}\n"
+        f"💾 <b>Сообщений:</b> <b>{stats['total_messages']}</b>\n"
+        f"🗑 <b>Удалений:</b> <b>{stats['deleted_messages']}</b>\n"
+        f"👤 <b>Подключений:</b> <b>{stats['active_connections']}</b>\n\n"
+        "💡 <b>Как восстановить данные:</b>\n"
+        "<i>Если после обновления Git или перезапуска база сбросилась, "
+        "просто отправьте этот файл боту в этот чат (можно с подписью <code>/restore</code>), "
+        "и бот мгновенно восстановит всю историю!</i>"
+    )
+
+    doc = FSInputFile(backup_path, filename=f"messages_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db")
+    await bot.send_document(chat_id=message.chat.id, document=doc, caption=caption)
 
 
 # ========================================================
@@ -372,9 +408,53 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot)
 
 
 # ========================================================
-# Сохранение медиа, отправленных напрямую в бота
+# Сохранение медиа или восстановление базы из бэкапа
 # ========================================================
-@dp.message(F.chat.type == "private", F.photo | F.video | F.voice | F.video_note | F.document)
+@dp.message(F.chat.type == "private", F.document)
+async def handle_document_or_restore(message: Message, bot: Bot):
+    sender_id = message.from_user.id if message.from_user else 0
+    doc_name = (message.document.file_name or "").lower()
+    caption = (message.caption or "").lower()
+
+    # Проверка: является ли присланный файл резервной копией базы
+    is_backup_file = doc_name.endswith(".db") or "/restore" in caption
+
+    if is_backup_file and await db.is_owner(sender_id):
+        temp_path = config.DATA_DIR / "temp_restore.db"
+        try:
+            await bot.download(message.document, destination=temp_path)
+            success = await db.restore_from_file(str(temp_path))
+            if temp_path.exists():
+                temp_path.unlink()
+
+            if success:
+                stats = await db.get_stats()
+                text = (
+                    "✅ <b>БАЗА ДАННЫХ УСПЕШНО ВОССТАНОВЛЕНА!</b>\n\n"
+                    "Все ваши данные и история возвращены:\n"
+                    f"• Сообщений в базе: <b>{stats['total_messages']}</b>\n"
+                    f"• Зафиксировано удалений: <b>{stats['deleted_messages']}</b>\n"
+                    f"• Активных подключений: <b>{stats['active_connections']}</b>"
+                )
+                await message.reply(text)
+                logger.info(f"База данных успешно восстановлена владельцем {sender_id}")
+                return
+            else:
+                await message.reply("❌ <b>Ошибка:</b> файл повреждён или не является корректной базой SQLite.")
+                return
+        except Exception as e:
+            logger.error(f"Ошибка при восстановлении базы данных: {e}")
+            await message.reply(f"❌ Ошибка восстановления: {e}")
+            return
+
+    # Обычное сохранение документа
+    has_media, media_path, media_type = await download_media(bot, message, message.chat.id, message.message_id)
+    if has_media and media_path:
+        reply_caption = f"✅ <b>{media_type} сохранено в постоянное хранилище!</b>"
+        await send_media_to_chat(bot, message.chat.id, media_path, media_type, reply_caption)
+
+
+@dp.message(F.chat.type == "private", F.photo | F.video | F.voice | F.video_note)
 async def handle_direct_media(message: Message, bot: Bot):
     has_media, media_path, media_type = await download_media(bot, message, message.chat.id, message.message_id)
     if has_media and media_path:

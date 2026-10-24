@@ -1,4 +1,6 @@
 import os
+import shutil
+import sqlite3
 import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -219,3 +221,50 @@ async def is_owner(user_id: int) -> bool:
         ) as cursor:
             row = await cursor.fetchone()
             return row is not None
+
+
+async def create_backup() -> Optional[str]:
+    """Сброс WAL-журнала и подготовка файла базы данных к отправке."""
+    if not DB_PATH.exists():
+        return None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            await db.commit()
+    except Exception:
+        pass
+    return str(DB_PATH)
+
+
+async def restore_from_file(new_db_path: str) -> bool:
+    """Проверка целостности и восстановление базы данных из присланного файла."""
+    try:
+        # Проверяем целостность файла через sqlite3
+        con = sqlite3.connect(new_db_path)
+        cur = con.cursor()
+        cur.execute("PRAGMA integrity_check;")
+        res = cur.fetchone()
+        con.close()
+        if not res or res[0] != "ok":
+            return False
+    except Exception:
+        return False
+
+    try:
+        # Заменяем текущую базу данных
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(new_db_path, DB_PATH)
+
+        # Удаляем временные WAL/SHM файлы старой сессии, если они есть
+        wal_file = DB_PATH.with_suffix(".db-wal")
+        shm_file = DB_PATH.with_suffix(".db-shm")
+        if wal_file.exists():
+            wal_file.unlink()
+        if shm_file.exists():
+            shm_file.unlink()
+
+        # Повторно инициализируем индексы и таблицы
+        await init_db()
+        return True
+    except Exception:
+        return False
