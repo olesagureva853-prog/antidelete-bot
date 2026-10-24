@@ -282,6 +282,17 @@ async def on_business_message(message: Message, bot: Bot):
         chat_title = message.chat.full_name or message.chat.title or f"Чат {chat_id}"
         text = message.text or message.caption or ""
 
+        # Определяем, отправлено ли сообщение владельцем (исходящее)
+        conn = await db.get_connection(conn_id)
+        owner_id = config.OWNER_ID or (conn.get("user_id") if conn else None)
+        is_outgoing = bool(sender_id and owner_id and sender_id == owner_id)
+
+        # Проверяем, является ли медиа сгорающим / исчезающим
+        is_disappearing = bool(
+            getattr(message, 'has_media_spoiler', False) or 
+            getattr(message, 'has_protected_content', False)
+        )
+
         # Кэшируем текущее сообщение и его медиа
         has_media, media_path, media_type = await download_media(bot, message, chat_id, msg_id)
 
@@ -297,31 +308,42 @@ async def on_business_message(message: Message, bot: Bot):
             has_media=has_media,
             media_path=media_path,
             media_type=media_type,
-            is_outgoing=False
+            is_outgoing=is_outgoing,
+            is_disappearing=is_disappearing
         )
 
         # ========================================================
-        # Перехват исчезающих/любых медиа при ответе (Reply)
+        # Перехват ТОЛЬКО исчезающих/сгорающих фото при ответе (Reply)
         # ========================================================
-        if message.reply_to_message and config.SAVE_MEDIA_ON_REPLY:
+        if message.reply_to_message and config.SAVE_MEDIA_ON_REPLY and is_outgoing:
             owner_chat_id = await db.get_owner_chat_id(conn_id)
             if owner_chat_id:
-                trigger = config.REPLY_TRIGGER_KEYWORD
+                replied = message.reply_to_message
                 user_text = (message.text or message.caption or "").strip()
-                is_trigger_matched = True
-                if trigger:
-                    is_trigger_matched = (user_text.lower() == trigger.lower()) or user_text.startswith(trigger)
 
-                if is_trigger_matched:
-                    replied = message.reply_to_message
-                    # Проверяем наличие медиа: сначала в кэше БД, затем напрямую из объекта
-                    cached = await db.get_message(chat_id, replied.message_id)
+                # Проверяем: это сгорающее / исчезающее фото?
+                is_disappearing_media = bool(
+                    getattr(replied, 'has_media_spoiler', False) or 
+                    getattr(replied, 'has_protected_content', False)
+                )
+
+                cached = await db.get_message(chat_id, replied.message_id)
+                if cached and cached.get("is_disappearing"):
+                    is_disappearing_media = True
+
+                # Принудительное сохранение обычного фото по спецкоманде /save или сохрани
+                forced_save = user_text.lower() in ("/save", "!save", "сохрани", "save")
+
+                # Если это ОБЫЧНАЯ картинка (не сгорающее фото) и нет явной команды — ПРОПУСКАЕМ!
+                if not is_disappearing_media and not forced_save:
+                    pass
+                else:
                     r_media_path = None
                     r_media_type = None
 
                     if cached and cached.get("has_media") and cached.get("media_path") and os.path.exists(cached["media_path"]):
                         r_media_path = cached["media_path"]
-                        r_media_type = cached.get("media_type") or "Фото"
+                        r_media_type = cached.get("media_type") or "Сгорающее фото"
                     else:
                         has_m, m_path, m_type = await download_media(bot, replied, chat_id, replied.message_id)
                         if has_m and m_path:
@@ -337,14 +359,14 @@ async def on_business_message(message: Message, bot: Bot):
                         escaped_chat = html.escape(chat_title)
 
                         caption = (
-                            "📥 <b>ПЕРЕХВАЧЕНО ФОТО / МЕДИА ИЗ ОТВЕТА!</b>\n\n"
+                            "🔥 <b>ПЕРЕХВАЧЕНО СГОРАЮЩЕЕ ФОТО!</b>\n\n"
                             f"👤 <b>От:</b> {user_str}\n"
                             f"💬 <b>Чат:</b> {escaped_chat}\n"
-                            f"📎 <b>Тип:</b> {html.escape(r_media_type or 'Вложение')}\n\n"
-                            "<i>Медиафайл отправлен вам в бота. Вы можете посмотреть его прямо здесь, не открывая в основном диалоге!</i>"
+                            f"📎 <b>Тип:</b> {html.escape(r_media_type or 'Исчезающее фото')}\n\n"
+                            "<i>Медиафайл успешно сохранён. Вы можете посмотреть его прямо здесь, не открывая в основном диалоге!</i>"
                         )
                         await send_media_to_chat(bot, owner_chat_id, r_media_path, r_media_type, caption)
-                        logger.info(f"Перехвачено медиа из ответа на сообщение {replied.message_id} для {owner_chat_id}")
+                        logger.info(f"Перехвачено сгорающее медиа из ответа на сообщение {replied.message_id}")
 
     except Exception as e:
         logger.error(f"Ошибка при обработке business_message: {e}")
@@ -369,6 +391,15 @@ async def on_edited_business_message(message: Message, bot: Bot):
 
         old_text = saved.get("text") or ""
         if old_text == new_text or not new_text:
+            return
+
+        # Проверка: если сообщение отредактировал сам владелец — обновляем в БД, но НЕ оповещаем
+        conn = await db.get_connection(message.business_connection_id)
+        owner_id = config.OWNER_ID or (conn.get("user_id") if conn else None)
+        sender_id = message.from_user.id if message.from_user else None
+
+        if saved.get("is_outgoing") or (sender_id and owner_id and sender_id == owner_id):
+            await db.update_message_text(saved["id"], new_text)
             return
 
         owner_chat_id = await db.get_owner_chat_id(message.business_connection_id)
@@ -417,6 +448,11 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot)
         for msg_id in event.message_ids:
             record = await db.get_message(chat_id, msg_id)
             if not record or record.get("is_deleted"):
+                continue
+
+            # Проверка: если сообщение было отправлено самим владельцем — не оповещаем
+            if record.get("is_outgoing"):
+                logger.info(f"Сообщение {msg_id} удалено владельцем бота — уведомление пропущено.")
                 continue
 
             await db.mark_message_deleted(record["id"])

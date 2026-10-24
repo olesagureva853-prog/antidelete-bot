@@ -58,6 +58,13 @@ async def init_db():
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg ON messages(chat_id, msg_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON messages(created_at);")
+
+        # Миграция: добавляем колонку is_disappearing если её ещё нет
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN is_disappearing INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
         await db.commit()
 
 
@@ -122,7 +129,8 @@ async def save_message(
     has_media: bool = False,
     media_path: Optional[str] = None,
     media_type: Optional[str] = None,
-    is_outgoing: bool = False
+    is_outgoing: bool = False,
+    is_disappearing: bool = False
 ):
     """Сохранение сообщения в базу данных."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -130,8 +138,8 @@ async def save_message(
             INSERT INTO messages (
                 connection_id, msg_id, chat_id, chat_title, sender_id, sender_name,
                 sender_username, text, has_media, media_path, media_type,
-                is_outgoing, is_deleted, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now', 'localtime'))
+                is_outgoing, is_deleted, is_disappearing, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, datetime('now', 'localtime'))
         """, (
             connection_id,
             msg_id,
@@ -144,7 +152,8 @@ async def save_message(
             1 if has_media else 0,
             media_path,
             media_type,
-            1 if is_outgoing else 0
+            1 if is_outgoing else 0,
+            1 if is_disappearing else 0
         ))
         await db.commit()
 
