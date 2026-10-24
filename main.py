@@ -111,6 +111,11 @@ async def send_media_to_chat(bot: Bot, chat_id: int, media_path: str, media_type
 # ========================================================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
+    if message.from_user:
+        u = message.from_user
+        full_name = f"{u.first_name} {u.last_name or ''}".strip()
+        await db.track_user(u.id, full_name, u.username)
+
     bot_info = await bot.get_me()
     text = (
         "👋 <b>Привет! Я бот для сохранения удалённых и отредактированных сообщений.</b>\n\n"
@@ -124,7 +129,8 @@ async def cmd_start(message: Message, bot: Bot):
         "будут мгновенно пересылаться вам прямо в этот диалог с ботом!\n\n"
         "🛠 <b>Команды управления:</b>\n"
         "• /status — статистика базы данных и статус подключений\n"
-        "• /backup — скачать резервную копию базы данных (для сохранения истории при обновлениях)"
+        "• /users — список пользователей и подключений (только для владельца)\n"
+        "• /backup — скачать резервную копию базы данных"
     )
     await message.answer(text)
 
@@ -182,6 +188,50 @@ async def cmd_backup(message: Message, bot: Bot):
     await bot.send_document(chat_id=message.chat.id, document=doc, caption=caption)
 
 
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    # Просмотр всех пользователей бота (только для владельца)
+    sender_id = message.from_user.id if message.from_user else 0
+    if not await db.is_owner(sender_id):
+        await message.answer("⛔ <b>Доступ запрещён.</b> Эта команда доступна только владельцу бота.")
+        return
+
+    data = await db.get_bot_users_list()
+    b_users = data["business_users"]
+    d_users = data["direct_users"]
+
+    lines = ["👥 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ БОТА</b>\n"]
+
+    # 1. Бизнес-подключения (кто подключил бота к своим личным чатам)
+    lines.append(f"💼 <b>Подключённые бизнес-аккаунты ({len(b_users)}):</b>")
+    if b_users:
+        for idx, u in enumerate(b_users, 1):
+            name = html.escape(u.get("user_name") or "Пользователь")
+            username = f"(@{u['user_username']})" if u.get("user_username") else ""
+            status = "🟢 Активно" if u.get("is_enabled") else "🔴 Отключено"
+            date = u.get("updated_at") or ""
+            lines.append(f"{idx}. <b>{name}</b> {username} [<code>{u['user_id']}</code>] — {status} ({date})")
+    else:
+        lines.append("<i>Пока нет активных бизнес-подключений.</i>")
+
+    lines.append("")
+
+    # 2. Пользователи, которые писали боту в ЛС
+    lines.append(f"💬 <b>Пользователи в диалоге с ботом ({len(d_users)}):</b>")
+    if d_users:
+        for idx, u in enumerate(d_users[:30], 1):
+            name = html.escape(u.get("full_name") or "Пользователь")
+            username = f"(@{u['username']})" if u.get("username") else ""
+            date = u.get("last_seen") or ""
+            lines.append(f"{idx}. <b>{name}</b> {username} [<code>{u['user_id']}</code>] — {date}")
+        if len(d_users) > 30:
+            lines.append(f"<i>...и ещё {len(d_users) - 30} пользователей.</i>")
+    else:
+        lines.append("<i>Пока никто не писал боту напрямую.</i>")
+
+    await message.answer("\n".join(lines))
+
+
 # ========================================================
 # Обработка подключения Telegram Business
 # ========================================================
@@ -189,6 +239,7 @@ async def cmd_backup(message: Message, bot: Bot):
 async def on_business_connection(conn: BusinessConnection, bot: Bot):
     user = conn.user
     user_name = f"{user.first_name} {user.last_name or ''}".strip()
+    await db.track_user(user.id, user_name, user.username)
     await db.save_connection(
         connection_id=conn.id,
         user_id=user.id,
@@ -412,6 +463,10 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot)
 # ========================================================
 @dp.message(F.chat.type == "private", F.document)
 async def handle_document_or_restore(message: Message, bot: Bot):
+    if message.from_user:
+        u = message.from_user
+        await db.track_user(u.id, f"{u.first_name} {u.last_name or ''}".strip(), u.username)
+
     sender_id = message.from_user.id if message.from_user else 0
     doc_name = (message.document.file_name or "").lower()
     caption = (message.caption or "").lower()
@@ -456,6 +511,10 @@ async def handle_document_or_restore(message: Message, bot: Bot):
 
 @dp.message(F.chat.type == "private", F.photo | F.video | F.voice | F.video_note)
 async def handle_direct_media(message: Message, bot: Bot):
+    if message.from_user:
+        u = message.from_user
+        await db.track_user(u.id, f"{u.first_name} {u.last_name or ''}".strip(), u.username)
+
     has_media, media_path, media_type = await download_media(bot, message, message.chat.id, message.message_id)
     if has_media and media_path:
         caption = f"✅ <b>{media_type} сохранено в постоянное хранилище!</b>"

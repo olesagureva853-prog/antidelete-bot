@@ -25,6 +25,16 @@ async def init_db():
             );
         """)
 
+        # Таблица пользователей бота
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT,
+                username TEXT,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         # Таблица сохраненных сообщений
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -268,3 +278,44 @@ async def restore_from_file(new_db_path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+async def track_user(user_id: int, full_name: str, username: Optional[str]):
+    """Фиксация пользователя бота (кто запустил бота или написал ему)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO bot_users (user_id, full_name, username, last_seen)
+            VALUES (?, ?, ?, datetime('now', 'localtime'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                full_name = excluded.full_name,
+                username = excluded.username,
+                last_seen = excluded.last_seen;
+        """, (user_id, full_name, username))
+        await db.commit()
+
+
+async def get_bot_users_list() -> Dict[str, Any]:
+    """Получение списков бизнес-подключений и пользователей бота."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Подключения Telegram Business
+        cursor = await db.execute("""
+            SELECT user_id, user_name, user_username, is_enabled, updated_at
+            FROM business_connections
+            ORDER BY updated_at DESC
+        """)
+        business = [dict(r) for r in await cursor.fetchall()]
+
+        # Все пользователи бота в ЛС
+        cursor = await db.execute("""
+            SELECT user_id, full_name, username, last_seen
+            FROM bot_users
+            ORDER BY last_seen DESC
+        """)
+        users = [dict(r) for r in await cursor.fetchall()]
+
+        return {
+            "business_users": business,
+            "direct_users": users
+        }
