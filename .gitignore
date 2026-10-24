@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables & secrets
+.env
+*.session
+*.session-journal
+
+# Local databases and media cache
+data/
+media/
+*.db
+*.sqlite3
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
